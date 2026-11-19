@@ -1,6 +1,7 @@
 import { readdir, rm, stat } from "node:fs/promises";
 import path from "node:path";
-import { encodeClipWithFfmpeg, probeMediaTiming } from "./encoder.js";
+import { formatTimestamp } from "../../shared/index.js";
+import { encodeClipWithFfmpeg } from "./encoder.js";
 import {
   classifyYtDlpStderr,
   inspectSourceVideo,
@@ -8,7 +9,6 @@ import {
 } from "./inspector.js";
 import { ProcessExitError, runCommand } from "./process.js";
 
-export const SECTION_PADDING_SECONDS = 10;
 export const MAX_FULL_FALLBACK_DURATION_SECONDS = 15 * 60;
 
 export interface RunClipMediaParams {
@@ -50,6 +50,45 @@ export function parseYtDlpProgressLine(line: string): number | null {
   return Number.isFinite(pct) ? Math.max(0, Math.min(100, pct)) : null;
 }
 
+export function parseFfmpegTimeProgress(
+  line: string,
+  expectedDurationSeconds: number,
+): { percent: number; currentSeconds: number } | null {
+  if (!Number.isFinite(expectedDurationSeconds) || expectedDurationSeconds <= 0) {
+    return null;
+  }
+
+  if (line.startsWith("out_time_us=")) {
+    const rawUs = Number.parseInt(line.slice("out_time_us=".length), 10);
+    if (!Number.isFinite(rawUs) || rawUs < 0) return null;
+    const currentSeconds = rawUs / 1_000_000;
+    const percent = Math.max(
+      0,
+      Math.min(99, (currentSeconds / expectedDurationSeconds) * 100),
+    );
+    return { percent, currentSeconds };
+  }
+
+  const timeMatch = /\btime=(\d{2}):(\d{2}):(\d{2}(?:\.\d+)?)/.exec(line);
+  if (!timeMatch) return null;
+
+  const hours = Number.parseInt(timeMatch[1]!, 10);
+  const minutes = Number.parseInt(timeMatch[2]!, 10);
+  const seconds = Number.parseFloat(timeMatch[3]!);
+  if (!Number.isFinite(hours) || !Number.isFinite(minutes) || !Number.isFinite(seconds)) {
+    return null;
+  }
+
+  const currentSeconds = hours * 3600 + minutes * 60 + seconds;
+  if (currentSeconds < 0) return null;
+
+  const percent = Math.max(
+    0,
+    Math.min(99, (currentSeconds / expectedDurationSeconds) * 100),
+  );
+  return { percent, currentSeconds };
+}
+
 async function findDownloadedSourceFile(workDir: string): Promise<string> {
   const entries = await readdir(workDir);
   const candidate = entries.find(
@@ -86,13 +125,6 @@ export class LocalMediaRunner implements MediaRunner {
     const isPartial =
       params.startSeconds > 0 || params.endSeconds < params.durationSeconds;
 
-    const padStart = isPartial
-      ? Math.max(0, params.startSeconds - SECTION_PADDING_SECONDS)
-      : 0;
-    const padEnd = isPartial
-      ? Math.min(params.durationSeconds, params.endSeconds + SECTION_PADDING_SECONDS)
-      : params.durationSeconds;
-
     const formatSelector = `${params.formatId}+bestaudio/best[height<=1080]`;
     const outputTemplate = path.join(params.workDir, "source.%(ext)s");
 
@@ -101,7 +133,10 @@ export class LocalMediaRunner implements MediaRunner {
     const runYtDlp = async (useSection: boolean) => {
       const args = [
         "--no-playlist",
+        "--progress",
         "--newline",
+        "--progress-delta",
+        "0.25",
         "--no-warnings",
         "-f",
         formatSelector,
@@ -114,41 +149,75 @@ export class LocalMediaRunner implements MediaRunner {
       if (useSection) {
         args.push(
           "--download-sections",
-          `*${padStart}-${padEnd}`,
+          `*${params.startSeconds}-${params.endSeconds}`,
+          "--force-keyframes-at-cuts",
           "--downloader-args",
-          "ffmpeg_o:-copyts",
-          "--postprocessor-args",
-          "Merger:-copyts -avoid_negative_ts disabled",
+          "ffmpeg_o:-stats -stats_period 0.25",
         );
       }
 
       args.push(params.canonicalUrl);
 
       let lastPct = -1;
+      let destinationCount = 0;
+
+      const emitDownloadProgress = (percent: number, detail: string) => {
+        const rounded = Math.max(0, Math.min(99, Math.round(percent)));
+        if (rounded > lastPct) {
+          lastPct = rounded;
+          params.onProgress({
+            state: "downloading",
+            percent: rounded,
+            detail,
+          });
+        }
+      };
+
       params.onProgress({
         state: "downloading",
         percent: 0,
-        detail: useSection ? "Downloading requested segment..." : "Downloading video...",
+        detail: useSection
+          ? "Downloading requested segment..."
+          : "Downloading video stream...",
       });
+
+      const handleLine = (line: string) => {
+        if (line.includes("[download] Destination:")) {
+          destinationCount += 1;
+          return;
+        }
+
+        if (line.includes("[Merger]")) {
+          emitDownloadProgress(98, "Merging video and audio...");
+          return;
+        }
+
+        const ytPct = parseYtDlpProgressLine(line);
+        if (ytPct !== null) {
+          if (useSection) {
+            emitDownloadProgress(ytPct * 0.96, "Downloading requested segment...");
+          } else if (destinationCount <= 1) {
+            emitDownloadProgress(ytPct * 0.8, "Downloading video stream...");
+          } else {
+            emitDownloadProgress(80 + ytPct * 0.16, "Downloading audio stream...");
+          }
+          return;
+        }
+
+        const expectedDuration = useSection ? clipDuration : params.durationSeconds;
+        const ffmpegProg = parseFfmpegTimeProgress(line, expectedDuration);
+        if (ffmpegProg !== null) {
+          emitDownloadProgress(
+            ffmpegProg.percent,
+            `Downloading segment (${formatTimestamp(ffmpegProg.currentSeconds)} / ${formatTimestamp(expectedDuration)})...`,
+          );
+        }
+      };
 
       await runCommand("yt-dlp", args, {
         signal: params.signal,
-        onStdoutLine: (line) => {
-          const pct = parseYtDlpProgressLine(line);
-          if (pct !== null) {
-            const rounded = Math.round(pct);
-            if (rounded !== lastPct) {
-              lastPct = rounded;
-              params.onProgress({
-                state: "downloading",
-                percent: rounded,
-                detail: useSection
-                  ? "Downloading requested segment..."
-                  : "Downloading video...",
-              });
-            }
-          }
-        },
+        onStdoutLine: handleLine,
+        onStderrLine: handleLine,
       });
 
       params.onProgress({
@@ -200,16 +269,7 @@ export class LocalMediaRunner implements MediaRunner {
     }
 
     const downloadedPath = await findDownloadedSourceFile(params.workDir);
-    const probed = await probeMediaTiming(downloadedPath, params.signal);
-
-    let trimStartSeconds: number;
-    if (usedFullDownload) {
-      trimStartSeconds = params.startSeconds;
-    } else if (probed.startTimeSeconds > 0.5) {
-      trimStartSeconds = Math.max(0, params.startSeconds - probed.startTimeSeconds);
-    } else {
-      trimStartSeconds = Math.max(0, params.startSeconds - padStart);
-    }
+    const trimStartSeconds = usedFullDownload ? params.startSeconds : 0;
 
     await encodeClipWithFfmpeg({
       inputPath: downloadedPath,
