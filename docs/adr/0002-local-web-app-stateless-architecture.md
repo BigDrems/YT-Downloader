@@ -1,0 +1,3 @@
+# Stateless local web app with TypeScript Node.js and React/Vite
+
+We are building a personal local web app in a single-package TypeScript repository (`src/server/`, `src/client/`, `src/shared/`) using a Node.js API server and React/Vite frontend, delivering finished Clips via browser download from auto-cleaned temporary storage with no database or permanent library. Running locally avoids YouTube datacenter IP blocking while still giving us an embedded video preview for timestamp picking (unlike a CLI) without desktop packaging overhead. A dedicated Node.js backend cleanly manages single-active `yt-dlp`/`ffmpeg` child processes, live progress streaming, and cancellation, while stateless temp cleanup avoids duplicate files alongside the browser's Downloads folder.
