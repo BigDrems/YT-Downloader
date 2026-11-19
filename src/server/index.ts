@@ -1,6 +1,7 @@
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { serve } from "@hono/node-server";
+import type { HealthResponse } from "../shared/index.js";
 import { createApp } from "./app.js";
 import { ClipJobManager } from "./jobs/clip-job-manager.js";
 import { checkBinaryHealth, LocalMediaRunner } from "./media/index.js";
@@ -13,18 +14,31 @@ async function main() {
   const jobManager = new ClipJobManager({ mediaRunner });
   await jobManager.initialize();
 
-  const health = await checkBinaryHealth();
-  if (!health.ok) {
-    console.warn("Warning: One or more required binaries are unavailable:", health);
-  } else {
-    console.log(
-      `Dependencies OK — yt-dlp: ${health.ytDlp.version}, ffmpeg ready`,
-    );
-  }
+  let cachedHealthPromise: Promise<HealthResponse> | null = null;
+  const getHealth = (options?: { refresh?: boolean }): Promise<HealthResponse> => {
+    if (options?.refresh || !cachedHealthPromise) {
+      cachedHealthPromise = checkBinaryHealth();
+    }
+    return cachedHealthPromise;
+  };
+
+  // Warm health check in the background so the HTTP server starts immediately.
+  void getHealth().then((health) => {
+    if (!health.ok) {
+      console.warn(
+        "Warning: One or more required binaries are unavailable:",
+        health,
+      );
+    } else {
+      console.log(
+        `Dependencies OK — yt-dlp: ${health.ytDlp.version}, ffmpeg ready`,
+      );
+    }
+  });
 
   const app = createApp({
     jobManager,
-    checkHealth: checkBinaryHealth,
+    checkHealth: getHealth,
     clientDistDir,
   });
 

@@ -19,7 +19,7 @@ import { InspectSourceError } from "./media/index.js";
 
 export interface CreateAppOptions {
   jobManager: ClipJobManager;
-  checkHealth: () => Promise<HealthResponse>;
+  checkHealth: (options?: { refresh?: boolean }) => Promise<HealthResponse>;
   clientDistDir?: string;
 }
 
@@ -53,7 +53,8 @@ export function createApp(options: CreateAppOptions): Hono {
   const { jobManager, checkHealth, clientDistDir } = options;
 
   app.get("/api/health", async (c) => {
-    const health = await checkHealth();
+    const refresh = c.req.query("refresh") === "1";
+    const health = await checkHealth({ refresh });
     return c.json(health, 200);
   });
 
