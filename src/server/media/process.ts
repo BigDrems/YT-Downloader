@@ -105,6 +105,7 @@ export function runCommand(
 
     const child = spawn(command, [...args], {
       cwd: options.cwd,
+      env: { ...process.env, PYTHONUNBUFFERED: "1" },
       windowsHide: true,
       stdio: ["ignore", "pipe", "pipe"],
     });

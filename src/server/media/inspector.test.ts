@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest";
 import { classifyYtDlpStderr } from "./inspector.js";
-import { parseYtDlpProgressLine } from "./runner.js";
+import {
+  parseFfmpegTimeProgress,
+  parseYtDlpProgressLine,
+} from "./runner.js";
 
 describe("classifyYtDlpStderr", () => {
   it("detects private / age-restricted / auth errors", () => {
@@ -33,5 +36,24 @@ describe("parseYtDlpProgressLine", () => {
     ).toBe(42.7);
     expect(parseYtDlpProgressLine("[download] 100% of 10.00MiB in 00:01")).toBe(100);
     expect(parseYtDlpProgressLine("[Merger] Merging formats into source.mkv")).toBeNull();
+  });
+});
+
+describe("parseFfmpegTimeProgress", () => {
+  it("parses ffmpeg stderr time=HH:MM:SS.xx status lines during section download", () => {
+    const parsed = parseFfmpegTimeProgress(
+      "frame=  360 fps=120 q=-1.0 size=    4096kB time=00:00:15.00 bitrate=2236.9kbits/s speed=4.0x",
+      30,
+    );
+    expect(parsed).toEqual({ percent: 50, currentSeconds: 15 });
+  });
+
+  it("parses out_time_us lines and clamps at 99%", () => {
+    expect(parseFfmpegTimeProgress("out_time_us=15000000", 30)).toEqual({
+      percent: 50,
+      currentSeconds: 15,
+    });
+    expect(parseFfmpegTimeProgress("out_time_us=35000000", 30)?.percent).toBe(99);
+    expect(parseFfmpegTimeProgress("frame=0 time=N/A bitrate=N/A", 30)).toBeNull();
   });
 });
